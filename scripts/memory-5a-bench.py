@@ -2,9 +2,15 @@
 """五層記憶 5A+ 基準測試 — 可調輪次（1-500），含反應速度 & 百分位延遲
 
 用法：
-  python3 memory-5a-bench.py          # 預設 50 輪
+  python3 memory-5a-bench.py          # 預設 50 輪（MemOS/Cognee 連 NAS）
   python3 memory-5a-bench.py 100      # 100 輪
   python3 memory-5a-bench.py 500      # 最大 500 輪
+  python3 memory-5a-bench.py --memos-url http://127.0.0.1:8765   # 本機 MemOS
+  python3 memory-5a-bench.py --cognee-url http://127.0.0.1:8000  # 本機 Cognee
+
+預設端點（跟 OpenClaw 配置一致）：
+  MemOS:  http://10.10.10.66:8765 (NAS)
+  Cognee: http://10.10.10.66:8766 (NAS)
 """
 
 import subprocess, time, json, os, csv, sys, statistics, argparse
@@ -12,8 +18,14 @@ import subprocess, time, json, os, csv, sys, statistics, argparse
 parser = argparse.ArgumentParser(description="五層記憶 5A+ 基準測試")
 parser.add_argument("rounds", nargs="?", type=int, default=50,
                     help="測試輪次 (1-500，預設 50)")
+parser.add_argument("--memos-url", default="http://10.10.10.66:8765",
+                    help="MemOS base URL (預設 NAS: http://10.10.10.66:8765)")
+parser.add_argument("--cognee-url", default="http://10.10.10.66:8766",
+                    help="Cognee Sidecar base URL (預設 NAS: http://10.10.10.66:8766)")
 args = parser.parse_args()
 TOTAL_ROUNDS = max(1, min(500, args.rounds))
+MEMOS_URL = args.memos_url.rstrip("/")
+COGNEE_URL = args.cognee_url.rstrip("/")
 CSV_PATH = "/tmp/memory-5a-bench.csv"
 LOG_PATH = "/tmp/memory-5a-bench.log"
 LCM_DB = os.path.expanduser("~/.openclaw/lcm.db")
@@ -126,7 +138,7 @@ for i in range(1, TOTAL_ROUNDS + 1):
 
     # ═══ L3: Cognee Sidecar ═══
     # L3/health
-    ok, ms = timed_run(lambda: curl_status("GET", "http://127.0.0.1:8000/api/v1/auth/me", timeout=5) in ("200", "401"))
+    ok, ms = timed_run(lambda: curl_status("GET", f"{COGNEE_URL}/api/v1/auth/me", timeout=5) in ("200", "401"))
     results.append((i, "L3", "health", ok, ms))
     if not ok: round_errors.append("L3/health")
 
@@ -134,7 +146,7 @@ for i in range(1, TOTAL_ROUNDS + 1):
     token = ""
     def do_login():
         global token
-        resp = curl_json("POST", "http://127.0.0.1:8000/api/v1/auth/login",
+        resp = curl_json("POST", f"{COGNEE_URL}/api/v1/auth/login",
             data="username=default_user@example.com&password=default_password",
             headers=["Content-Type: application/x-www-form-urlencoded"], timeout=5)
         d = json.loads(resp)
@@ -147,7 +159,7 @@ for i in range(1, TOTAL_ROUNDS + 1):
     # L3/search (404 = empty dataset, still means service works)
     def do_search():
         if not token: return False
-        code = curl_status("POST", "http://127.0.0.1:8000/api/v1/search",
+        code = curl_status("POST", f"{COGNEE_URL}/api/v1/search",
             data=json.dumps({"query": "test", "search_type": "CHUNKS"}),
             headers=[f"Authorization: Bearer {token}", "Content-Type: application/json"], timeout=5)
         return code in ("200", "404")
@@ -158,7 +170,7 @@ for i in range(1, TOTAL_ROUNDS + 1):
     # ═══ L3.5: MemOS ═══
     # L35/search
     def memos_search():
-        r = curl_json("POST", "http://127.0.0.1:8765/product/search",
+        r = curl_json("POST", f"{MEMOS_URL}/product/search",
             data=json.dumps({"query": "test", "user_id": "openclaw", "top_k": 1}),
             headers=["Content-Type: application/json"], timeout=10)
         return "200" in r or "success" in r.lower() or "Search completed" in r
@@ -168,7 +180,7 @@ for i in range(1, TOTAL_ROUNDS + 1):
 
     # L35/add
     def memos_add():
-        r = curl_json("POST", "http://127.0.0.1:8765/product/add",
+        r = curl_json("POST", f"{MEMOS_URL}/product/add",
             data=json.dumps({
                 "user_id": "openclaw",
                 "session_id": f"bench-{i}",
