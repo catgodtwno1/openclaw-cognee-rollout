@@ -20,7 +20,7 @@ Use this skill to reproduce the working Cognee setup that was validated on 2026-
 ## Canonical known-good shape
 
 - Cognee backend: `0.5.5-local`
-- LLM model: `openai/Qwen/Qwen2.5-72B-Instruct`
+- LLM model: `openai/Qwen/Qwen2.5-32B-Instruct` (via SiliconFlow)
 - Embedding model: `openai/BAAI/bge-m3`
 - Tokenizer: `BAAI/bge-m3`
 - Search type: `CHUNKS`
@@ -107,6 +107,25 @@ Then run:
 ```bash
 openclaw cognee index
 ```
+
+## Cognee API Quick Reference
+
+| 功能 | 方法 | 路径 | Content-Type | 说明 |
+|------|------|------|-------------|------|
+| Health | GET | `/health` | — | 返回 `{"status":"ready","health":"healthy"}` |
+| Health (详细) | GET | `/health/detailed` | — | 含组件级状态 |
+| Login | POST | `/api/v1/users/signin` | `application/json` | Body: `{"username":"...","password":"..."}` → 返回 `access_token` |
+| Login (旧) | POST | `/api/v1/auth/login` | `application/x-www-form-urlencoded` | 仅 Cognee 0.5.5 旧版兼容 |
+| Search | POST | `/api/v1/search` | `application/json` | Body: `{"query":"...","datasets":["openclaw-init"]}` ⚠️ 需 Bearer token |
+| Add | POST | `/api/v1/add` | `multipart/form-data` | 上传文件/文本到 dataset |
+| Cognify | POST | `/api/v1/cognify` | `application/json` | 触发知识图谱构建 |
+| Datasets | GET | `/api/v1/datasets` | — | 列出所有 datasets |
+| Settings | GET | `/api/v1/settings` | — | 查看当前配置 |
+
+**⚠️ 常见错误路径（全部返回 404）：**
+- ❌ `/search` → 正确：`/api/v1/search`
+- ❌ `/api/v1/health` → 正确：`/health`
+- ❌ `/api/v1/signin` → 正确：`/api/v1/users/signin`
 
 ## Verification rule
 
@@ -202,7 +221,7 @@ Cognee 有嚴格的多租戶隔離。**切換用戶 = 數據消失**。
     "entries": {
       "cognee": {
         "config": {
-          "baseUrl": "http://10.10.10.66:8766",
+          "baseUrl": "http://<COGNEE_HOST>:8000",
           "username": "default_user@example.com",
           "password": "default_password"
         }
@@ -215,7 +234,7 @@ Cognee 有嚴格的多租戶隔離。**切換用戶 = 數據消失**。
 **⚠️ 關鍵規則：**
 - 四台 Mac Mini **必須用同一個賬號**（`default_user@example.com / default_password`）
 - **絕對不要**改成 `admin2@cognee.ai` 或其他賬號——會立刻看不到所有數據
-- 之前踩過的坑：老大曾用 `admin2@cognee.ai`（ID: 95cf83e5），結果搜索全空，因為數據屬於 `default_user`（ID: f5249267）
+- 之前踩過的坑：曾用 `admin2@cognee.ai`（ID: 95cf83e5），結果搜索全空，因為數據屬於 `default_user`（ID: f5249267）
 - 新機器 onboard 時，直接用 `onboard_cognee_client.sh` 腳本，賬號已內建
 
 ### 與 MemOS 的差異
@@ -233,95 +252,15 @@ Cognee has multi-tenant isolation. If you change the username/password in config
 
 ## Monitoring
 
-Use the bench script to run periodic health checks:
+Use the five-layer memory benchmark (from `ops-five-layer-memory` skill) for periodic health checks. It tests all 5 memory layers with timing data and can run as a cron job.
 
-```bash
-python3 scripts/memory-5a-bench.py
-```
+## Known performance issues
 
-This tests all 5 memory layers (L1 LCM, L2 LanceDB, L3 Cognee, L3.5 MemOS, L5 Files) with timing data. Can be set as a cron job for hourly monitoring.
+See [references/performance-issues.md](references/performance-issues.md) for TCP leak analysis, GRAPH_COMPLETION timeout, and single-worker bottleneck details.
 
-## Known performance issues (2026-03-25)
+## NAS Deployment Notes
 
-### TCP connection leak in litellm embedding
-
-**Symptom:** Cognee search latency degrades over time. `netstat` shows hundreds of ESTABLISHED connections to SiliconFlow.
-
-**Root cause:** `litellm.aembedding()` creates new `httpx.AsyncClient` connections per call without pooling. When `asyncio.wait_for` timeout cancels requests, connections leak. Default `litellm.request_timeout = 6000` (100 minutes!) keeps leaked connections alive.
-
-**Fix:** In Cognee container, edit `/app/.venv/lib/python3.12/site-packages/cognee/infrastructure/databases/vector/embeddings/LiteLLMEmbeddingEngine.py`:
-
-```python
-# After litellm.set_verbose = False
-litellm.request_timeout = 30.0  # Prevent 6000s default causing connection leak
-```
-
-**Verification:**
-```bash
-docker exec cognee python3 -c "
-with open('/proc/net/tcp') as f:
-    lines = f.readlines()[1:]
-    est = sum(1 for l in lines if int(l.split()[3],16)==1)
-    print(f'TCP ESTABLISHED: {est}')
-"
-# Should be <10, not hundreds
-```
-
-### GRAPH_COMPLETION search mode causes 30s timeouts
-
-**Symptom:** Cognee search requests timeout at 30s. Logs show vector retrieval + graph projection complete in <1s, but HTTP response never returns.
-
-**Root cause:** Default `search_type = GRAPH_COMPLETION` calls LLM for answer generation after retrieval. If LLM is slow (MiniMax, etc.), the request hangs until gunicorn timeout.
-
-**Fix:** Always use `search_type = "CHUNKS"` (pure vector search, no LLM post-processing). OpenClaw plugin config:
-
-```json
-{
-  "searchType": "CHUNKS"
-}
-```
-
-**Impact on stress tests:** The 11% failure rate in 500-round stress tests was caused by this — the test script used default GRAPH_COMPLETION mode, not the CHUNKS mode OpenClaw actually uses. Production is unaffected.
-
-### Single worker limitation
-
-Cognee runs `gunicorn -w 1` (single worker). One stuck request blocks all others. Cannot increase workers because SQLite + LanceDB don't support concurrent writes. This is a design constraint, not a bug.
-
-## NAS Deployment Notes (QNAP/Synology)
-
-### Docker network requirement
-
-Same as MemOS: default bridge network does NOT support container DNS. Create a custom network:
-
-```bash
-$DOCKER network create oc-memory
-$DOCKER network connect oc-memory oc-cognee-api
-$DOCKER network connect oc-memory oc-qdrant
-$DOCKER network connect oc-memory oc-neo4j
-```
-
-### Cognee user account on NAS
-
-NAS Cognee uses the same default user: `default_user@example.com` / `default_password`. All data belongs to this user. Do NOT switch to a different user unless you want a fresh empty dataset.
-
-### NAS-specific image build notes
-
-- UV timeout: set `UV_HTTP_TIMEOUT=300` in Dockerfile `ENV` (NAS download speed may be slow)
-- Pre-pull base image: `docker pull python:3.12-slim` before build
-- Embedding dimension: set `EMBEDDING_DIMENSION=1024` for bge-m3 compatibility
-
-### Persisting Cognee patches on NAS
-
-Same strategy as MemOS:
-1. Bind mount patched files (e.g., LiteLLMEmbeddingEngine.py)
-2. Docker commit as backup image
-
-```bash
-$DOCKER cp oc-cognee-api:/app/.venv/lib/python3.12/site-packages/cognee/infrastructure/databases/vector/embeddings/LiteLLMEmbeddingEngine.py /path/to/LiteLLMEmbeddingEngine_patched.py
-
-# Bind mount on recreate:
--v /path/to/LiteLLMEmbeddingEngine_patched.py:/app/.venv/lib/python3.12/site-packages/cognee/infrastructure/databases/vector/embeddings/LiteLLMEmbeddingEngine.py
-```
+See [references/nas-deployment.md](references/nas-deployment.md) for QNAP/Synology-specific configuration, Docker paths, and resource allocation.
 
 ## Cognee 壓測腳本
 
@@ -336,7 +275,7 @@ python3 scripts/cognee_stress_test.py --mode add --rounds 50
 python3 scripts/cognee_stress_test.py --mode both --rounds 50
 
 # 指定 URL + 清理
-python3 scripts/cognee_stress_test.py --url http://10.10.10.66:8766 --rounds 100 --cleanup
+python3 scripts/cognee_stress_test.py --url http://<COGNEE_HOST>:8000 --rounds 100 --cleanup
 ```
 
 判定標準：
@@ -344,100 +283,9 @@ python3 scripts/cognee_stress_test.py --url http://10.10.10.66:8766 --rounds 100
 - ⚠️ WARN: search P95 < 5s 但衰退 > 2.0x（連接泄漏/telemetry 可能未修）
 - ❌ FAIL: search P95 ≥ 5s 或有錯誤
 
-## Data Migration (跨機器遷移)
+## Data Migration
 
-### When to migrate
-
-- Moving from local Docker (Colima) to NAS
-- Consolidating multiple machines' Cognee data
-- Disaster recovery
-
-### What can be migrated
-
-| Data | Method | Notes |
-|------|--------|-------|
-| LanceDB vectors | rsync (files) | Full fidelity, cross-platform |
-| SQLite metadata | rsync (file) | Included in databases/ dir |
-| Graph data (kuzu) | ❌ Not compatible with neo4j | Requires re-cognify on destination |
-| Graph data (neo4j → neo4j) | Neo4j dump/load | Same DB engine only |
-| User accounts | ❌ Manual | Must pre-exist on destination |
-
-### Migration script
-
-```bash
-# Local Mac → NAS via SSH
-bash scripts/cognee_migrate.sh \
-  --src-path ~/.local/share/cognee/databases \
-  --dst-host openclaw@10.10.10.66 \
-  --dst-path /share/CACHEDEV1_DATA/Container/openclaw-memory/cognee-data/databases \
-  --stop-container \
-  --dst-docker /share/CACHEDEV1_DATA/.qpkg/container-station/bin/docker
-
-# Dry run first
-bash scripts/cognee_migrate.sh \
-  --src-path ~/.local/share/cognee/databases \
-  --dst-host openclaw@10.10.10.66 \
-  --dst-path /share/path/databases \
-  --dry-run
-
-# Local-to-local (Docker volume → backup)
-bash scripts/cognee_migrate.sh \
-  --src-path /var/lib/docker/volumes/cognee/_data/databases \
-  --dst-path /backup/cognee-databases
-```
-
-### Finding source data path
-
-| Environment | Typical path |
-|-------------|-------------|
-| macOS Colima | `~/.local/share/cognee/databases` or Docker volume |
-| Docker bind mount | Whatever `-v` points to |
-| NAS QNAP | `/share/CACHEDEV1_DATA/Container/openclaw-memory/cognee-data/databases` |
-
-To find the actual path inside a running container:
-```bash
-docker exec oc-cognee-api python3 -c "import cognee; print(cognee.config.data_root_directory)"
-```
-
-### Known pitfalls
-
-1. **Graph DB incompatibility**: macOS Cognee typically uses **kuzu**; NAS Cognee uses **neo4j**. Graph relationships can't transfer between them. LanceDB vectors still work — Cognee can search by vector without graph, but `GRAPH_COMPLETION` search mode won't work until re-cognified.
-
-2. **NAS /tmp is tiny**: QNAP `/tmp` is a 64MB tmpfs. Never use `tar` to `/tmp`. Use rsync direct transfer.
-
-3. **rsync "failed to set times" warning**: Harmless on NAS — QNAP doesn't support setting mtime on some mount points. Data is still transferred correctly.
-
-4. **User isolation**: All data belongs to a specific Cognee user (typically `default_user@example.com`). The destination Cognee must use the **same user account** or the data won't be visible.
-
-5. **Stop container during transfer**: LanceDB files can corrupt if Cognee writes during rsync. Stop the destination container first (`--stop-container` flag).
-
-### Post-migration verification
-
-```bash
-# Restart destination Cognee
-docker restart oc-cognee-api
-
-# Run smoke test
-python3 scripts/cognee_smoke_test.py --base-url http://DEST_IP:8766
-
-# Run stress test (search only — don't add until verified)
-python3 scripts/cognee_stress_test.py --url http://DEST_IP:8766 --mode search --rounds 50
-
-# If graph DB changed (kuzu → neo4j), optionally re-cognify:
-# Login → POST /api/v1/cognify with a small test dataset
-```
-
-### Complete migration checklist
-
-- [ ] Stop destination Cognee container
-- [ ] Run rsync of `databases/` directory
-- [ ] Verify file count matches source
-- [ ] Start destination Cognee container
-- [ ] Confirm `/` returns "I am alive"
-- [ ] Login with correct user (`default_user@example.com`)
-- [ ] Search returns results from migrated data
-- [ ] Run stress test (50+ rounds, zero errors)
-- [ ] Update OpenClaw configs on all client machines to point to new server
+See [references/data-migration.md](references/data-migration.md) for cross-machine migration (local→NAS, LanceDB vectors, graph DB compatibility, migration script, and post-migration checklist).
 
 ## Operational advice
 

@@ -5,13 +5,13 @@
 #   # Local Mac → NAS (via SSH)
 #   bash cognee_migrate.sh \
 #     --src-path /path/to/cognee-data/databases \
-#     --dst-host openclaw@10.10.10.66 \
+#     --dst-host openclaw@<NAS_HOST> \
 #     --dst-path /share/CACHEDEV1_DATA/Container/openclaw-memory/cognee-data/databases
 #
 #   # Dry run (show what would transfer)
 #   bash cognee_migrate.sh \
 #     --src-path /path/to/cognee-data/databases \
-#     --dst-host openclaw@10.10.10.66 \
+#     --dst-host openclaw@<NAS_HOST> \
 #     --dst-path /share/path/databases \
 #     --dry-run
 #

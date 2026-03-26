@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
+import os
 """Cognee Sidecar 壓測腳本 — 測試 search + add 在持續請求下的延遲穩定性
 
 用法：
   python3 cognee_stress_test.py                                    # 預設 100 輪，NAS
   python3 cognee_stress_test.py --rounds 50                        # 50 輪
-  python3 cognee_stress_test.py --url http://10.10.10.66:8766      # 指定 URL
+  python3 cognee_stress_test.py --url http://YOUR_HOST:8000     # 指定 URL
   python3 cognee_stress_test.py --delay 0.5                        # 每輪間隔 500ms
   python3 cognee_stress_test.py --mode search                      # 只測搜索
   python3 cognee_stress_test.py --mode add                         # 只測寫入
@@ -151,8 +152,8 @@ def print_stats(label: str, times: list):
 
 def main():
     parser = argparse.ArgumentParser(description="Cognee Sidecar 壓測")
-    parser.add_argument("--url", default="http://10.10.10.66:8766",
-                        help="Cognee base URL (預設 http://10.10.10.66:8766)")
+    parser.add_argument("--url", default=os.environ.get("COGNEE_URL", "http://127.0.0.1:8000"),
+                        help="Cognee base URL (預設 $COGNEE_URL 或 http://127.0.0.1:8000)")
     parser.add_argument("--rounds", type=int, default=100,
                         help="測試輪次 (預設 100)")
     parser.add_argument("--delay", type=float, default=0.3,
