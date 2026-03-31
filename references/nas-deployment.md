@@ -1,36 +1,62 @@
-## NAS Deployment Notes (QNAP/Synology)
+# NAS Deployment (updated 2026-03-31)
 
-### Docker network requirement
+## Current NAS Stack (10.10.10.66)
 
-Same as MemOS: default bridge network does NOT support container DNS. Create a custom network:
+| Container | Image | Ports | Status |
+|-----------|-------|-------|--------|
+| oc-neo4j | neo4j:2026.02.3 | 7474, 7687 | 3,671 Memory nodes (legacy MemOS) |
+| oc-postgres | pgvector/pgvector:pg16 | 5432 | Hindsight DB, 1,712+ memories |
+| oc-cognee | cognee-fixed:v5 | 8000 | M2.7-HS, 3 datasets |
+| oc-hindsight | ghcr.io/vectorize-io/hindsight:latest | 9077, 9999 | M2.7-HS |
 
-```bash
-$DOCKER network create oc-memory
-$DOCKER network connect oc-memory oc-cognee-api
-$DOCKER network connect oc-memory oc-qdrant
-$DOCKER network connect oc-memory oc-neo4j
-```
+**Removed:** MemOS, Qdrant (replaced by LanceDB-Pro + Cognee + Hindsight)
 
-### Cognee user account on NAS
-
-NAS Cognee uses the same default user: `default_user@example.com` / `default_password`. All data belongs to this user. Do NOT switch to a different user unless you want a fresh empty dataset.
-
-### NAS-specific image build notes
-
-- UV timeout: set `UV_HTTP_TIMEOUT=300` in Dockerfile `ENV` (NAS download speed may be slow)
-- Pre-pull base image: `docker pull python:3.12-slim` before build
-- Embedding dimension: set `EMBEDDING_DIMENSION=1024` for bge-m3 compatibility
-
-### Persisting Cognee patches on NAS
-
-Same strategy as MemOS:
-1. Bind mount patched files (e.g., LiteLLMEmbeddingEngine.py)
-2. Docker commit as backup image
+## SSH Access
 
 ```bash
-$DOCKER cp oc-cognee-api:/app/.venv/lib/python3.12/site-packages/cognee/infrastructure/databases/vector/embeddings/LiteLLMEmbeddingEngine.py /path/to/LiteLLMEmbeddingEngine_patched.py
-
-# Bind mount on recreate:
--v /path/to/LiteLLMEmbeddingEngine_patched.py:/app/.venv/lib/python3.12/site-packages/cognee/infrastructure/databases/vector/embeddings/LiteLLMEmbeddingEngine.py
+ssh openclaw@10.10.10.66  # Passwordless ed25519 key
 ```
 
+## Docker on QNAP
+
+Docker compose path varies by QNAP model:
+```bash
+# Try these in order:
+docker compose ...
+/share/CACHEDEV1_DATA/.qpkg/container-station/bin/docker-compose ...
+```
+
+⚠️ QNAP Container Station may have different docker-compose paths. Check with `which docker-compose` or `find / -name docker-compose 2>/dev/null`.
+
+## NAS Cognee Configuration
+
+Same as local but with NAS-specific paths:
+
+```yaml
+# docker-compose.yml (relevant section)
+oc-cognee:
+  image: cognee-fixed:v5
+  ports:
+    - "0.0.0.0:8000:8000"
+  environment:
+    LLM_MODEL: openai/MiniMax-M2.7-highspeed
+    LLM_ENDPOINT: https://api.minimaxi.com/v1
+    LLM_ARGS: '{"max_tokens":8192,"timeout":120}'
+    LLM_MAX_COMPLETION_TOKENS: "8192"
+    EMBEDDING_MODEL: openai/BAAI/bge-m3
+    EMBEDDING_ENDPOINT: https://api.siliconflow.cn/v1
+    EMBEDDING_DIMENSIONS: "1024"
+    # ... (same env as local)
+```
+
+## Data Migration History
+
+- 3,486 memories imported from NAS Qdrant → local Cognee (dataset: nas-import)
+- 1,290 memories synced local Hindsight → NAS Hindsight
+- NAS serves as backup/archive, local (老大) is primary
+
+## NAS Role
+
+- **Cold backup:** Holds complete imported data from legacy MemOS/Qdrant
+- **Neo4j archive:** 3,671 Memory nodes from MemOS era (read-only reference)
+- **Not primary:** All 4 Mac minis point to 老大 (10.10.20.178) for live Cognee, not NAS

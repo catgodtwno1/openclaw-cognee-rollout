@@ -5,7 +5,7 @@ description: Deploy, repair, harden, and verify OpenClaw + Cognee memory on a Ma
 
 # OpenClaw Cognee Rollout
 
-Use this skill to reproduce the working Cognee setup that was validated on 2026-03-21.
+Use this skill to reproduce the working Cognee setup. Last validated: 2026-03-31.
 
 ## What this skill standardizes
 
@@ -19,12 +19,24 @@ Use this skill to reproduce the working Cognee setup that was validated on 2026-
 
 ## Canonical known-good shape
 
-- Cognee backend: `0.5.5-local`
-- LLM model: `openai/Qwen/Qwen2.5-32B-Instruct` (via SiliconFlow)
-- Embedding model: `openai/BAAI/bge-m3`
-- Tokenizer: `BAAI/bge-m3`
+- Cognee backend: `0.5.6-local` (Docker image: `cognee-fixed:v5`)
+- LLM model: `openai/MiniMax-M2.7-highspeed` (via MiniMax API `api.minimaxi.com`)
+- LLM max_tokens: `8192` (M2.7-HS reasoning model needs headroom for thinking + output)
+- Embedding model: `openai/BAAI/bge-m3` (via SiliconFlow)
+- Embedding dimensions: `1024`
 - Search type: `CHUNKS`
-- Working dataset pattern: create a fresh dataset when prior datasets were polluted by failed update/cognify runs
+- Port binding: `0.0.0.0:8000` (NOT `127.0.0.1` — other machines need LAN access)
+- Working dataset: `openclaw-main-v7`
+- Auth: disabled (`REQUIRE_AUTHENTICATION=false`)
+
+### Model selection notes
+
+| Model | Status | Notes |
+|-------|--------|-------|
+| SiliconFlow Qwen2.5-32B | ❌ | TPM rate limit on free tier |
+| MiniMax M2.1-HS | ❌ | Thinking tokens overflow, zero JSON output |
+| MiniMax M2.5-HS | ✅ | Works but nondeterministic |
+| **MiniMax M2.7-HS** | ✅ **Best** | 100% success at max_tokens=8192 |
 
 ## Server vs client mode
 
@@ -51,36 +63,32 @@ Use another Mac mini as an OpenClaw client that talks to the shared Cognee host.
 
 Use `references/client-mode.md` for the exact config shape.
 
-## Required fixes
+## Required fixes (baked into cognee-fixed:v5)
 
-### 1) Patch Cognee backend
+These patches are pre-applied in the Docker image `cognee-fixed:v5`. You only need to rebuild if starting from `cognee/cognee:latest`.
 
-Run:
+### PATCH1: Message role order fix
+
+MiniMax requires system message at position 0. Cognee sends `[user, system]` order.
+
+Files patched in litellm_instructor:
+- `azure_openai/adapter.py`
+- `gemini/adapter.py`
+- `openai/adapter.py`
+- `generic_llm_api/adapter.py`
+
+### PATCH2: Embedding dimensions removal
+
+SiliconFlow BAAI/bge-m3 rejects `dimensions=3072` parameter (HTTP 422).
+`LITELLM_DROP_PARAMS=true` is insufficient — manually removed dimensions kwarg in `LiteLLMEmbeddingEngine`.
+
+### Legacy patches (still available but rarely needed)
 
 ```bash
-bash skills/openclaw-cognee-rollout/scripts/apply_cognee_hotfix.sh
+# Only needed if building from scratch without cognee-fixed:v5
+bash skills/ops-cognee-rollout/scripts/apply_cognee_hotfix.sh
+python3 skills/ops-cognee-rollout/scripts/patch_openclaw_cognee_plugin.py
 ```
-
-What it fixes:
-
-- suppress embedding `dimensions` in LiteLLM embedding calls
-- set Cognee default embedding dimension to `1024`
-
-Without this, SiliconFlow + `bge-m3` fails during cognify/retrieval.
-
-### 2) Patch OpenClaw plugin
-
-Run:
-
-```bash
-python3 skills/openclaw-cognee-rollout/scripts/patch_openclaw_cognee_plugin.py
-```
-
-What it fixes:
-
-- `update` failure on Cognee 0.5.5 is converted into `replace` behavior (`add new` + `delete old`)
-
-Without this, dirty files often poison datasets and later cognify runs.
 
 ## Configure a client quickly
 
@@ -197,10 +205,11 @@ Do not waste time trying to salvage a poisoned dataset unless the user explicitl
 
 | User | Password | ID | Notes |
 |------|----------|----|-------|
-| `default_user@example.com` | `default_password` | `<USER_UUID>` | Auto-created at server init. All data ingested before custom user setup lives here. **This is the data owner on <HOST_NAME>.** |
-| `admin2@cognee.ai` | `<YOUR_PASSWORD>` | `<USER_UUID>` | Manually registered. Has empty data directory. |
+| `default_user@example.com` | `default_password` | auto-created | Default owner. All data lives here when auth is disabled. |
 
-**Important:** The auth endpoint is `POST /api/v1/auth/login` with `Content-Type: application/x-www-form-urlencoded`. NOT `/api/v1/users/signin`, NOT JSON body.
+**Current setup:** Auth is disabled (`REQUIRE_AUTHENTICATION=false`). All requests use default_user implicitly. No login needed.
+
+**When auth is enabled:** The auth endpoint is `POST /api/v1/auth/login` with `Content-Type: application/x-www-form-urlencoded`.
 
 ## Multi-Machine Deployment (多台 Mac Mini 共用)
 
